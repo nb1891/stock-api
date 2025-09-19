@@ -69,27 +69,38 @@ class AutoData:
     if not _HAS_YF:
         raise RuntimeError("yfinance not installed. Run: pip install yfinance")
 
+    # Hämta 1d-bars, inga pre/post, auto_adjust
     tkr = yf.Ticker(self.ticker)
-    hist = tkr.history(period=f"{self.years}y", interval="1d", auto_adjust=True, actions=False, prepost=False)
+    hist = tkr.history(period=f"{self.years}y", interval="1d",
+                       auto_adjust=True, actions=False, prepost=False)
     if hist.empty:
         raise RuntimeError(f"No price history for {self.ticker}")
     prices = hist.reset_index()[['Date','Close']]
     prices.columns = ['date','close']
     prices['date'] = pd.to_datetime(prices['date'])
 
+    # Benchmark
     bench_ticker = self._pick_index()
-    b_hist = yf.Ticker(bench_ticker).history(period=f"{self.years}y", interval="1d", auto_adjust=True, actions=False, prepost=False)
+    b_hist = yf.Ticker(bench_ticker).history(period=f"{self.years}y", interval="1d",
+                                             auto_adjust=True, actions=False, prepost=False)
     if b_hist.empty:
         raise RuntimeError(f"No index history for {bench_ticker}")
     bench = b_hist.reset_index()[['Date','Close']]
     bench.columns = ['date','close']
     bench['date'] = pd.to_datetime(bench['date'])
 
-    # 🔒 Ta bort dagens rad (intradag) – behåll bara fullständiga dagsstaplar
-    today = pd.Timestamp.utcnow().normalize()
-    prices = prices[prices['date'] < today]
-    bench  = bench[bench['date']  < today]
-    return prices, bench
+    # 🔒 Frys till gårdagens stängning (UTC) för att undvika intradagsrader
+    utc_today = pd.Timestamp.utcnow().normalize()
+    cutoff = utc_today - pd.Timedelta(days=1)
+    prices = prices[prices['date'] <= cutoff]
+    bench  = bench[bench['date']  <= cutoff]
+
+    # 🔒 Synka till gemensam max-dag (om index/aktie har olika senaste datum)
+    common_last = min(prices['date'].max(), bench['date'].max())
+    prices = prices[prices['date'] <= common_last]
+    bench  = bench[bench['date']  <= common_last]
+
+    return prices.sort_values('date'), bench.sort_values('date')
 
 
 # -------------------------
@@ -104,13 +115,15 @@ def compute_features(prices: pd.DataFrame, bench: pd.DataFrame, horizon_m: int) 
     dfp['ret'] = dfp['close'].pct_change()
     dfb['ret'] = dfb['close'].pct_change()
 
+    # Fönsterlängder
     n = max(1, int(round(21 * horizon_m)))
     vol_lb = max(21, int(round(21 * horizon_m)))
 
+    # Momentum
     dfp['mom_h'] = dfp['close'].pct_change(n)
     dfb['mom_h'] = dfb['close'].pct_change(n)
 
-    # ❗ Synka bara gemensamma datum (inner join) så sista raden blir stabil
+    # ❗ Endast gemensamma datum → stabil sista rad
     m = pd.merge(
         dfp[['date','mom_h','ret','close']],
         dfb[['date','mom_h']].rename(columns={'mom_h':'mom_h_idx'}),
@@ -119,9 +132,9 @@ def compute_features(prices: pd.DataFrame, bench: pd.DataFrame, horizon_m: int) 
 
     m['excess_mom_h'] = m['mom_h'] - m['mom_h_idx']
 
-    # Beräkna volatilitet och trend på den synkade ret-serien
+    # Vol och trend på synkat returflöde
     m['vol_daily'] = m['ret'].rolling(vol_lb).std()
-    m['vol_ann']   = m['vol_daily'].apply(annualize_vol)
+    m['vol_ann'] = m['vol_daily'].apply(annualize_vol)
     m['pos_ratio'] = m['ret'].rolling(n).apply(lambda x: np.mean(x > 0), raw=True)
 
     return m
