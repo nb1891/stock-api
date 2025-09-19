@@ -66,59 +66,66 @@ class AutoData:
         return DEFAULT_INDEX
 
     def fetch(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        if not _HAS_YF:
-            raise RuntimeError("yfinance not installed. Run: pip install yfinance")
-        tkr = yf.Ticker(self.ticker)
-        hist = tkr.history(period=f"{self.years}y", auto_adjust=True)
-        if hist.empty:
-            raise RuntimeError(f"No price history for {self.ticker}")
-        prices = hist.reset_index()[['Date','Close']]
-        prices.columns = ['date','close']
-        prices['date'] = pd.to_datetime(prices['date'])
-        # Benchmark
-        bench_ticker = self._pick_index()
-        b_hist = yf.Ticker(bench_ticker).history(period=f"{self.years}y", auto_adjust=True)
-        if b_hist.empty:
-            raise RuntimeError(f"No index history for {bench_ticker}")
-        bench = b_hist.reset_index()[['Date','Close']]
-        bench.columns = ['date','close']
-        bench['date'] = pd.to_datetime(bench['date'])
-        return prices, bench
+    if not _HAS_YF:
+        raise RuntimeError("yfinance not installed. Run: pip install yfinance")
+
+    tkr = yf.Ticker(self.ticker)
+    hist = tkr.history(period=f"{self.years}y", interval="1d", auto_adjust=True, actions=False, prepost=False)
+    if hist.empty:
+        raise RuntimeError(f"No price history for {self.ticker}")
+    prices = hist.reset_index()[['Date','Close']]
+    prices.columns = ['date','close']
+    prices['date'] = pd.to_datetime(prices['date'])
+
+    bench_ticker = self._pick_index()
+    b_hist = yf.Ticker(bench_ticker).history(period=f"{self.years}y", interval="1d", auto_adjust=True, actions=False, prepost=False)
+    if b_hist.empty:
+        raise RuntimeError(f"No index history for {bench_ticker}")
+    bench = b_hist.reset_index()[['Date','Close']]
+    bench.columns = ['date','close']
+    bench['date'] = pd.to_datetime(bench['date'])
+
+    # 🔒 Ta bort dagens rad (intradag) – behåll bara fullständiga dagsstaplar
+    today = pd.Timestamp.utcnow().normalize()
+    prices = prices[prices['date'] < today]
+    bench  = bench[bench['date']  < today]
+    return prices, bench
+
 
 # -------------------------
 # Feature engineering driven by horizon
 # -------------------------
 
 def compute_features(prices: pd.DataFrame, bench: pd.DataFrame, horizon_m: int) -> pd.DataFrame:
-    """Compute momentum and risk features using windows derived from horizon."""
     dfp = prices.copy().sort_values('date')
     dfb = bench.copy().sort_values('date')
 
-    # Daily returns
+    # Dagliga avkastningar
     dfp['ret'] = dfp['close'].pct_change()
     dfb['ret'] = dfb['close'].pct_change()
 
-    # Window lengths
-    n = max(1, int(round(21 * horizon_m)))           # ~ trading days for horizon months
-    vol_lb = max(21, int(round(21 * horizon_m)))     # volatility lookback
+    n = max(1, int(round(21 * horizon_m)))
+    vol_lb = max(21, int(round(21 * horizon_m)))
 
-    # Momentum over horizon (stock and index)
     dfp['mom_h'] = dfp['close'].pct_change(n)
     dfb['mom_h'] = dfb['close'].pct_change(n)
-    # Excess momentum (stock minus index)
-    # Align dates
-    m = pd.merge(dfp[['date','mom_h','ret','close']], dfb[['date','mom_h']].rename(columns={'mom_h':'mom_h_idx'}),
-                 on='date', how='left')
+
+    # ❗ Synka bara gemensamma datum (inner join) så sista raden blir stabil
+    m = pd.merge(
+        dfp[['date','mom_h','ret','close']],
+        dfb[['date','mom_h']].rename(columns={'mom_h':'mom_h_idx'}),
+        on='date', how='inner'
+    )
+
     m['excess_mom_h'] = m['mom_h'] - m['mom_h_idx']
 
-    # Volatility (daily → annualized)
-    m['vol_daily'] = dfp['ret'].rolling(vol_lb).std()
-    m['vol_ann'] = m['vol_daily'].apply(annualize_vol)
-
-    # Simple trend filter: % of positive days in last n
-    m['pos_ratio'] = dfp['ret'].rolling(n).apply(lambda x: np.mean(x > 0), raw=True)
+    # Beräkna volatilitet och trend på den synkade ret-serien
+    m['vol_daily'] = m['ret'].rolling(vol_lb).std()
+    m['vol_ann']   = m['vol_daily'].apply(annualize_vol)
+    m['pos_ratio'] = m['ret'].rolling(n).apply(lambda x: np.mean(x > 0), raw=True)
 
     return m
+
 
 # -------------------------
 # Decision logic (BUY/HOLD/AVOID)
