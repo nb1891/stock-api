@@ -35,14 +35,14 @@ def evaluate(ticker: str = Query(..., description="e.g. AAPL or HSBA.L"),
         prices, bench = auto.fetch()
         feats = compute_features(prices, bench, horizon_m=horizon_m)
         decision = decide(feats, horizon_m=horizon_m)
+        company_name = _get_company_name(ticker)  # 👈 hämta företagsnamnet
 
         return {
             "ticker": ticker,
+            "company_name": company_name,   # 👈 nytt fält i svaret
             "horizon_m": horizon_m,
             "decision": decision
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-
 
